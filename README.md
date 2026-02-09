@@ -1,4 +1,4 @@
-# Análise Económica e de Despesa em Saúde 
+# Análise económica das despesas com cuidados de saúde do INPS 
 ## 📌 Visão Geral do Projeto
 
 Este projeto foi desenvolvido para analisar, integrar e modelar dados macroeconómicos e das despesas do ramo doença e maternidade, permitindo:
