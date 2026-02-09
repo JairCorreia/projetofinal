@@ -1,8 +1,7 @@
 # app/streamlit_app.py
 # ============================================================
-# DASHBOARD 
-
-
+# DASHBOARD — Notebook-aligned (resultados iguais ao notebook)
+# ============================================================
 
 import sys
 from pathlib import Path
@@ -18,7 +17,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-# IMPORTS DA TUA CAMADA src/
+# IMPORTS DA CAMADA src/
 from src.agent_ai import run_agent
 from src.ml import compare_models, time_series_cv_rmse
 
@@ -143,6 +142,24 @@ def top_n_weights(df_ref: pd.DataFrame, rubricas: list[str], total_col: str, n: 
     return out
 
 
+# ----------------------------
+# Notebook-aligned preparation
+# ----------------------------
+def prepare_period_df(df_in: pd.DataFrame, cols_needed: list[str]) -> pd.DataFrame:
+    """
+    Garante exatamente o mesmo comportamento do notebook:
+    - ordena por Ano
+    - converte cols_needed para numérico
+    - remove linhas com NaN em cols_needed
+    """
+    d = df_in.copy()
+    d = d.sort_values("Ano")
+    for c in cols_needed:
+        d[c] = pd.to_numeric(d[c], errors="coerce")
+    d = d.dropna(subset=cols_needed).reset_index(drop=True)
+    return d
+
+
 # --- Elasticidade aproximada (IGUAL ao notebook: correlação de %Δ)
 def elasticidade_aproximada_notebook(
     df_in: pd.DataFrame,
@@ -214,7 +231,7 @@ def build_exog_future_from_mean_growth(df_hist: pd.DataFrame, exog_cols: list[st
     return pd.DataFrame(fut).astype(float)
 
 
-@st.cache_resource
+# IMPORTANTÍSSIMO: SEM CACHE para não “colar” resultados de outro filtro/período
 def fit_sarimax(y: np.ndarray, exog: np.ndarray):
     model = SARIMAX(
         y,
@@ -239,7 +256,6 @@ def forecast_sarimax_with_ci(res, exog_future: np.ndarray, steps: int):
 
     if ci_arr.ndim == 1:
         ci_arr = np.column_stack([ci_arr, ci_arr])
-
     if ci_arr.shape[1] != 2:
         ci_arr = ci_arr[:, :2]
 
@@ -274,7 +290,7 @@ except Exception as e:
     st.error(f"Erro ao carregar dataset: {e}")
     st.stop()
 
-# Detect columns (mantém o teu)
+# Detect columns
 col_despesa_total = detect_col(df, ["despesa_total", "Despesa_Total", "total_despesa", "Total_Despesa"])
 col_segurados = detect_col(df, ["Segurados", "segurados"])
 col_beneficiarios = detect_col(df, ["Beneficiarios", "Beneficiários", "beneficiarios", "beneficiários"])
@@ -282,7 +298,7 @@ col_pop = detect_col(df, ["Populacao", "População", "populacao", "população"
 col_gdp = detect_col(df, ["PIB", "NY.GDP.MKTP.CD", "gdp", "GDP"])
 col_infl = detect_col(df, ["Inflacao", "Inflação", "inflacao", "inflação"])
 
-# Colunas específicas do notebook (SARIMAX exógeno)
+# Colunas do notebook (SARIMAX exógeno)
 col_pop_emp = detect_col(df, ["População_empregada", "Populacao_empregada", "populacao_empregada"])
 col_pensionista_inps = detect_col(df, ["Pensionista_INPS", "pensionista_inps"])
 
@@ -356,7 +372,8 @@ elif menu == "Despesas":
         st.warning("Não encontrei coluna de despesa_total no dataset.")
         st.stop()
 
-    ser = df_periodo.set_index("Ano")[col_despesa_total].dropna()
+    d = prepare_period_df(df_periodo, ["Ano", col_despesa_total])
+    ser = d.set_index("Ano")[col_despesa_total]
     safe_line_plot(ser.index, ser.values, "Evolução — Despesa total", "Ano", "Despesa")
 
     c1, c2 = st.columns(2)
@@ -373,7 +390,8 @@ elif menu == "Despesas":
         rubricas_sel = st.multiselect("Rubricas", rubricas_cols_all, default=default_sel)
 
         for c in rubricas_sel:
-            ser_r = df_periodo.set_index("Ano")[c].dropna()
+            d2 = prepare_period_df(df_periodo, ["Ano", c])
+            ser_r = d2.set_index("Ano")[c]
             if ser_r.empty:
                 continue
             st.markdown(f"### {c}")
@@ -402,9 +420,9 @@ elif menu == "Elasticidades (Top 5)":
         st.warning("Sem despesa_total.")
         st.stop()
 
-    # notebook usa despesa_total como alvo
-    d = df_periodo.copy()
-    d = d.rename(columns={col_despesa_total: "despesa_total"})
+    d = df_periodo.copy().rename(columns={col_despesa_total: "despesa_total"})
+    # garante mesma base limpa antes do cálculo
+    d = prepare_period_df(d, ["Ano", "despesa_total"])
 
     out = elasticidade_aproximada_notebook(d, variavel_alvo="despesa_total", col_ano="Ano", top_n=5)
     if out.empty:
@@ -425,7 +443,8 @@ elif menu == "Segurados":
     if col_segurados is None:
         st.warning("Sem coluna de Segurados.")
         st.stop()
-    ser = df_periodo.set_index("Ano")[col_segurados].dropna()
+    d = prepare_period_df(df_periodo, ["Ano", col_segurados])
+    ser = d.set_index("Ano")[col_segurados]
     safe_line_plot(ser.index, ser.values, "Evolução — Segurados", "Ano", "Segurados")
 
 elif menu == "Beneficiários":
@@ -433,7 +452,8 @@ elif menu == "Beneficiários":
     if col_beneficiarios is None:
         st.warning("Sem coluna de Beneficiários.")
         st.stop()
-    ser = df_periodo.set_index("Ano")[col_beneficiarios].dropna()
+    d = prepare_period_df(df_periodo, ["Ano", col_beneficiarios])
+    ser = d.set_index("Ano")[col_beneficiarios]
     safe_line_plot(ser.index, ser.values, "Evolução — Beneficiários", "Ano", "Beneficiários")
 
 elif menu == "Previsão SARIMAX (notebook)":
@@ -462,12 +482,7 @@ elif menu == "Previsão SARIMAX (notebook)":
 
     d = df_periodo[["Ano", col_despesa_total] + exog_cols].copy()
     d = d.rename(columns={col_despesa_total: "despesa_total"})
-    d = d.sort_values("Ano")
-    # precisa dados completos
-    d["despesa_total"] = pd.to_numeric(d["despesa_total"], errors="coerce")
-    for c in exog_cols:
-        d[c] = pd.to_numeric(d[c], errors="coerce")
-    d = d.dropna()
+    d = prepare_period_df(d, ["Ano", "despesa_total"] + exog_cols)
 
     if len(d) < 8:
         st.info("Série curta para SARIMAX. Selecione mais anos no filtro de período.")
@@ -494,8 +509,8 @@ elif menu == "Previsão SARIMAX (notebook)":
         st.info("Clique em **Gerar previsão SARIMAX** para executar.")
         st.stop()
 
-    y = d["despesa_total"].values.astype(float)
-    exog_hist = d[exog_cols].values.astype(float)
+    y = d["despesa_total"].to_numpy(dtype=float)
+    exog_hist = d[exog_cols].to_numpy(dtype=float)
 
     try:
         res = fit_sarimax(y, exog_hist)
@@ -509,7 +524,7 @@ elif menu == "Previsão SARIMAX (notebook)":
         st.stop()
 
     try:
-        fc_mean, ci_low, ci_high = forecast_sarimax_with_ci(res, exog_future_df.values.astype(float), steps=steps)
+        fc_mean, ci_low, ci_high = forecast_sarimax_with_ci(res, exog_future_df.to_numpy(dtype=float), steps=steps)
     except Exception as e:
         st.error(f"Erro ao prever com SARIMAX: {e}")
         st.stop()
