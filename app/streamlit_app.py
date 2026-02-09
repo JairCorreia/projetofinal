@@ -1,9 +1,6 @@
 # app/streamlit_app.py
 # ============================================================
-# DASHBOARD (alinhado ao notebook Trabalho_final_PAGD_G3)
-# - Lê data/processed/dataset_merge_wb_gdp.csv
-# - Usa log_PIB_WB_USD = np.log(PIB_WB_USD) (igual notebook)
-# - ML igual notebook: baseline (lag1) + Ridge/Lasso/RF com GridSearchCV + TimeSeriesSplit
+# DASHBOARD — Notebook-aligned (resultados iguais ao notebook)
 # ============================================================
 
 import sys
@@ -14,20 +11,15 @@ import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
 
-from sklearn.model_selection import TimeSeriesSplit, GridSearchCV
-from sklearn.pipeline import Pipeline
-from sklearn.impute import SimpleImputer
-from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-from sklearn.linear_model import LinearRegression, Ridge, Lasso
-from sklearn.ensemble import RandomForestRegressor
+from statsmodels.tsa.statespace.sarimax import SARIMAX
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-# Agent (src/)
+# IMPORTS DA CAMADA src/
 from src.agent_ai import run_agent
+from src.ml import compare_models, time_series_cv_rmse
 
 
 # ----------------------------
@@ -81,52 +73,38 @@ def safe_line_plot(x, y, title, xlabel, ylabel):
     st.pyplot(fig)
 
 
-def safe_box_plot(values, title, ylabel):
-    fig, ax = plt.subplots()
-    ax.boxplot(values, vert=True)
-    ax.set_title(title)
-    ax.set_ylabel(ylabel)
-    ax.grid(True, alpha=0.3)
-    st.pyplot(fig)
-
-
 # ----------------------------
-# Data helpers (alinhado notebook)
+# Data helpers
 # ----------------------------
-def normalize_year_column(df: pd.DataFrame) -> pd.DataFrame:
-    d = df.copy()
-    d.columns = [str(c).strip() for c in d.columns]
-    for c in ["Ano", "ANO", "ano", "Year", "YEAR", "year"]:
-        if c in d.columns:
-            if c != "Ano":
-                d = d.rename(columns={c: "Ano"})
-            break
-    if "Ano" not in d.columns:
-        raise KeyError("Não encontrei coluna de ano (Ano/ANO/ano/Year).")
-
-    d["Ano"] = pd.to_numeric(d["Ano"], errors="coerce")
-    d = d.dropna(subset=["Ano"]).copy()
-    d["Ano"] = d["Ano"].astype(int)
-    d = d.sort_values("Ano").reset_index(drop=True)
-    return d
-
-
 @st.cache_data
 def load_data(csv_path: str) -> pd.DataFrame:
     df = pd.read_csv(csv_path)
-    df = normalize_year_column(df)
+    df.columns = [str(c).strip() for c in df.columns]
 
-    # Garantir colunas essenciais no formato esperado
-    if "PIB_WB_USD" in df.columns and "log_PIB_WB_USD" not in df.columns:
-        # notebook faz np.log (não log1p)
-        df["log_PIB_WB_USD"] = np.log(df["PIB_WB_USD"])
+    # normaliza coluna de ano
+    if "Ano" not in df.columns:
+        for c in df.columns:
+            if c.lower() in ("ano", "year"):
+                df = df.rename(columns={c: "Ano"})
+                break
 
+    if "Ano" not in df.columns:
+        raise ValueError("Dataset não tem coluna 'Ano'.")
+
+    df["Ano"] = pd.to_numeric(df["Ano"], errors="coerce").astype("Int64")
+    df = df.dropna(subset=["Ano"]).sort_values("Ano").reset_index(drop=True)
     return df
 
 
+def detect_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
+    for c in candidates:
+        if c in df.columns:
+            return c
+    return None
+
+
 def get_rubricas_cols(df: pd.DataFrame) -> list[str]:
-    # notebook gera despesa_sdo, despesa_maternidade, etc (lowercase)
-    return [c for c in df.columns if str(c).startswith("despesa_") and c != "despesa_total"]
+    return [c for c in df.columns if str(c).startswith("despesa_")]
 
 
 def calc_cagr(series: pd.Series) -> float | None:
@@ -135,9 +113,9 @@ def calc_cagr(series: pd.Series) -> float | None:
         return None
     vi = float(s.iloc[0])
     vf = float(s.iloc[-1])
-    n = len(s)
     if vi <= 0 or vf <= 0:
         return None
+    n = len(s)
     return (vf / vi) ** (1 / (n - 1)) - 1
 
 
@@ -160,156 +138,130 @@ def top_n_weights(df_ref: pd.DataFrame, rubricas: list[str], total_col: str, n: 
         val = float(df_ref[c].iloc[0]) if c in df_ref.columns and pd.notna(df_ref[c].iloc[0]) else 0.0
         w = (val / total) if total else np.nan
         rows.append({"Rubrica": c, "Valor": val, "Peso": w})
-    return pd.DataFrame(rows).sort_values("Peso", ascending=False).head(n)
+    out = pd.DataFrame(rows).sort_values("Peso", ascending=False).head(n)
+    return out
 
 
-def compute_elasticities(df_periodo: pd.DataFrame, target_col: str, feature_cols: list[str], top_n: int = 5):
-    d = df_periodo.sort_values("Ano").copy()
-    if len(d) < 4:
-        return pd.DataFrame()
+# ----------------------------
+# Notebook-aligned preparation
+# ----------------------------
+def prepare_period_df(df_in: pd.DataFrame, cols_needed: list[str]) -> pd.DataFrame:
+    """
+    Garante exatamente o mesmo comportamento do notebook:
+    - ordena por Ano
+    - converte cols_needed para numérico
+    - remove linhas com NaN em cols_needed
+    """
+    d = df_in.copy()
+    d = d.sort_values("Ano")
+    for c in cols_needed:
+        d[c] = pd.to_numeric(d[c], errors="coerce")
+    d = d.dropna(subset=cols_needed).reset_index(drop=True)
+    return d
 
-    t = pd.to_numeric(d[target_col], errors="coerce").replace([np.inf, -np.inf], np.nan)
-    t_pct = t.pct_change().replace([np.inf, -np.inf], np.nan)
+
+# --- Elasticidade aproximada (IGUAL ao notebook: correlação de %Δ)
+def elasticidade_aproximada_notebook(
+    df_in: pd.DataFrame,
+    variavel_alvo: str = "despesa_total",
+    col_ano: str = "Ano",
+    top_n: int = 5,
+) -> pd.DataFrame:
+    d = df_in.copy()
+
+    # numéricas, exclui ano e alvo
+    variaveis = [
+        v for v in d.columns
+        if v not in [col_ano, variavel_alvo]
+        and pd.api.types.is_numeric_dtype(d[v])
+    ]
 
     rows = []
-    for f in feature_cols:
-        if f not in d.columns:
-            continue
-        x = pd.to_numeric(d[f], errors="coerce").replace([np.inf, -np.inf], np.nan)
-        x_pct = x.pct_change().replace([np.inf, -np.inf], np.nan)
-        ratio = (t_pct / x_pct).replace([np.inf, -np.inf], np.nan).dropna()
-        if ratio.empty:
-            continue
-        rows.append({"Variável": f, "Elasticidade_média": float(ratio.mean()), "N": int(ratio.shape[0])})
+    for var in variaveis:
+        tmp = d[[variavel_alvo, var]].copy()
+        tmp[variavel_alvo] = pd.to_numeric(tmp[variavel_alvo], errors="coerce")
+        tmp[var] = pd.to_numeric(tmp[var], errors="coerce")
+        tmp = tmp.dropna()
+
+        tmp[f"{var}_pct"] = tmp[var].pct_change()
+        tmp[f"{variavel_alvo}_pct"] = tmp[variavel_alvo].pct_change()
+        tmp = tmp.replace([np.inf, -np.inf], np.nan).dropna()
+
+        if len(tmp) > 2:
+            corr = tmp[f"{var}_pct"].corr(tmp[f"{variavel_alvo}_pct"])
+            if pd.notna(corr):
+                rows.append({"Variável": var, "Elasticidade_aprox": float(corr)})
 
     if not rows:
         return pd.DataFrame()
 
-    return (
+    out = (
         pd.DataFrame(rows)
-        .sort_values("Elasticidade_média", key=lambda s: s.abs(), ascending=False)
+        .sort_values("Elasticidade_aprox", key=lambda s: s.abs(), ascending=False)
         .head(top_n)
+        .reset_index(drop=True)
     )
+    return out
 
 
-# ----------------------------
-# ML helpers (IGUAL AO NOTEBOOK)
-# ----------------------------
-def rmse(y_true, y_pred) -> float:
-    return float(np.sqrt(mean_squared_error(y_true, y_pred)))
+def save_report_md(report_md: str, report_path: Path) -> None:
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(report_md or "", encoding="utf-8")
 
 
-def evaluate(y_true, y_pred) -> dict:
-    return {
-        "MAE": float(mean_absolute_error(y_true, y_pred)),
-        "RMSE": rmse(y_true, y_pred),
-        "R2": float(r2_score(y_true, y_pred)),
-    }
+# --- Previsão SARIMAX (igual notebook)
+def build_exog_future_from_mean_growth(df_hist: pd.DataFrame, exog_cols: list[str], steps: int) -> pd.DataFrame:
+    """
+    Projeta exógenas para o futuro como no notebook:
+    exog_future[var] = last_value * (1 + mean_growth)**i
+    """
+    d = df_hist[exog_cols].copy().apply(pd.to_numeric, errors="coerce")
+    growth = d.pct_change().replace([np.inf, -np.inf], np.nan).mean(numeric_only=True)
+
+    last = d.iloc[-1]
+    fut = {}
+    for c in exog_cols:
+        g = float(growth.get(c, 0.0)) if pd.notna(growth.get(c, np.nan)) else 0.0
+        lv = float(last.get(c, np.nan))
+        if pd.isna(lv):
+            fut[c] = [np.nan] * steps
+        else:
+            fut[c] = [lv * (1 + g) ** i for i in range(1, steps + 1)]
+
+    return pd.DataFrame(fut).astype(float)
 
 
-def add_time_features(df: pd.DataFrame, target: str = "despesa_total", year_col: str = "Ano") -> pd.DataFrame:
-    d = df.sort_values(year_col).copy()
-    d[f"{target}_lag1"] = d[target].shift(1)
-    d[f"{target}_roll3"] = d[target].rolling(3).mean()
-    d[f"{target}_growth"] = d[target].pct_change()
-    return d
-
-
-def run_ml_like_notebook(df_periodo: pd.DataFrame, target_col: str = "despesa_total", year_col: str = "Ano", test_years: int = 3):
-    if target_col not in df_periodo.columns:
-        raise KeyError(f"Não existe a coluna '{target_col}' no dataset.")
-
-    df_ml = add_time_features(df_periodo, target=target_col, year_col=year_col).dropna(subset=[target_col])
-    num_cols = df_ml.select_dtypes(include=[np.number]).columns.tolist()
-    feature_cols = [c for c in num_cols if c not in (year_col, target_col)]
-
-    # Igual ao teu streamlit anterior: evitar Segurados e Beneficiários juntos (colinearidade alta)
-    if "Segurados" in feature_cols and "Beneficiários" in feature_cols:
-        feature_cols.remove("Beneficiários")
-
-    years = sorted(df_ml[year_col].dropna().astype(int).unique())
-    if len(years) <= test_years + 2:
-        raise ValueError("Poucos anos para treino/teste. Reduz test_years ou aumenta o período.")
-
-    cut = years[-test_years]
-    train = df_ml[df_ml[year_col] < cut].copy()
-    test = df_ml[df_ml[year_col] >= cut].copy()
-
-    X_train, y_train = train[feature_cols], train[target_col]
-    X_test, y_test = test[feature_cols], test[target_col]
-
-    baseline_pred = test[f"{target_col}_lag1"].values
-    results = [{"Modelo": "Baseline (Lag1)", **evaluate(y_test.values, baseline_pred)}]
-
-    pip_lin = Pipeline([("imputer", SimpleImputer(strategy="median")),
-                        ("scaler", StandardScaler()),
-                        ("model", LinearRegression())])
-
-    pip_ridge = Pipeline([("imputer", SimpleImputer(strategy="median")),
-                          ("scaler", StandardScaler()),
-                          ("model", Ridge())])
-
-    pip_lasso = Pipeline([("imputer", SimpleImputer(strategy="median")),
-                          ("scaler", StandardScaler()),
-                          ("model", Lasso(max_iter=5000))])
-
-    rf = Pipeline([("imputer", SimpleImputer(strategy="median")),
-                   ("model", RandomForestRegressor(random_state=42))])
-
-    tscv = TimeSeriesSplit(n_splits=4)
-
-    ridge_cv = GridSearchCV(
-        pip_ridge, {"model__alpha": [0.1, 1, 10, 50, 100]},
-        cv=tscv, scoring="neg_root_mean_squared_error"
+# IMPORTANTÍSSIMO: SEM CACHE para não “colar” resultados de outro filtro/período
+def fit_sarimax(y: np.ndarray, exog: np.ndarray):
+    model = SARIMAX(
+        y,
+        order=(1, 1, 1),
+        seasonal_order=(0, 0, 0, 0),
+        exog=exog,
+        enforce_stationarity=False,
+        enforce_invertibility=False,
     )
-    lasso_cv = GridSearchCV(
-        pip_lasso, {"model__alpha": [0.001, 0.01, 0.1, 1]},
-        cv=tscv, scoring="neg_root_mean_squared_error"
-    )
-    rf_cv = GridSearchCV(
-        rf,
-        {"model__n_estimators": [200, 500],
-         "model__max_depth": [None, 4, 6],
-         "model__min_samples_leaf": [1, 2, 4]},
-        cv=tscv, scoring="neg_root_mean_squared_error"
-    )
+    return model.fit(disp=False)
 
-    models = {
-        "LinearRegression": pip_lin,
-        "Ridge (CV)": ridge_cv,
-        "Lasso (CV)": lasso_cv,
-        "RandomForest (CV)": rf_cv,
-    }
 
-    preds = {}
-    for name, mdl in models.items():
-        mdl.fit(X_train, y_train)
-        pred = mdl.predict(X_test)
-        preds[name] = pred
-        results.append({"Modelo": name, **evaluate(y_test.values, pred)})
+def forecast_sarimax_with_ci(res, exog_future: np.ndarray, steps: int):
+    fc = res.get_forecast(steps=steps, exog=exog_future)
+    mean = np.asarray(fc.predicted_mean).reshape(-1)
 
-    res_df = pd.DataFrame(results).sort_values("RMSE").reset_index(drop=True)
-    best = res_df.iloc[0]["Modelo"]
-
-    if best != "Baseline (Lag1)":
-        best_model = models[best]
-        best_model.fit(X_train, y_train)
-        pred_best = best_model.predict(X_test)
+    ci_raw = fc.conf_int()
+    if isinstance(ci_raw, pd.DataFrame):
+        ci_arr = ci_raw.values
     else:
-        best_model = None
-        pred_best = baseline_pred
+        ci_arr = np.asarray(ci_raw)
 
-    return {
-        "df_ml": df_ml,
-        "feature_cols": feature_cols,
-        "train": train,
-        "test": test,
-        "res_df": res_df,
-        "best_name": best,
-        "best_model": best_model,
-        "pred_best": pred_best,
-        "y_test": y_test.values,
-    }
+    if ci_arr.ndim == 1:
+        ci_arr = np.column_stack([ci_arr, ci_arr])
+    if ci_arr.shape[1] != 2:
+        ci_arr = ci_arr[:, :2]
+
+    low = ci_arr[:, 0]
+    high = ci_arr[:, 1]
+    return mean, low, high
 
 
 # ----------------------------
@@ -317,19 +269,18 @@ def run_ml_like_notebook(df_periodo: pd.DataFrame, target_col: str = "despesa_to
 # ----------------------------
 apply_css()
 
-# Sidebar branding
 logo_path = ROOT_DIR / "figs" / "logo.png"
 if logo_path.exists():
     st.sidebar.image(str(logo_path), use_container_width=True)
 st.sidebar.markdown("### Projeto Final G3")
-st.sidebar.caption("Dashboard • Notebook-aligned • ML • Agent AI")
-
-st.title("📊 Dashboard (igual ao Notebook)")
+st.sidebar.caption("Dashboard • Notebook-aligned")
 
 
 # ----------------------------
 # Load dataset
 # ----------------------------
+st.title("📊 Dashboard")
+
 default_csv = str(ROOT_DIR / "data" / "processed" / "dataset_merge_wb_gdp.csv")
 csv_path = st.sidebar.text_input("Caminho do CSV (data/processed)", value=default_csv)
 
@@ -339,11 +290,20 @@ except Exception as e:
     st.error(f"Erro ao carregar dataset: {e}")
     st.stop()
 
-if "despesa_total" not in df.columns:
-    st.error("Não existe a coluna 'despesa_total' no dataset. Confirma se exportaste o CSV do notebook corretamente.")
-    st.stop()
+# Detect columns
+col_despesa_total = detect_col(df, ["despesa_total", "Despesa_Total", "total_despesa", "Total_Despesa"])
+col_segurados = detect_col(df, ["Segurados", "segurados"])
+col_beneficiarios = detect_col(df, ["Beneficiarios", "Beneficiários", "beneficiarios", "beneficiários"])
+col_pop = detect_col(df, ["Populacao", "População", "populacao", "população"])
+col_gdp = detect_col(df, ["PIB", "NY.GDP.MKTP.CD", "gdp", "GDP"])
+col_infl = detect_col(df, ["Inflacao", "Inflação", "inflacao", "inflação"])
+
+# Colunas do notebook (SARIMAX exógeno)
+col_pop_emp = detect_col(df, ["População_empregada", "Populacao_empregada", "populacao_empregada"])
+col_pensionista_inps = detect_col(df, ["Pensionista_INPS", "pensionista_inps"])
 
 rubricas_cols_all = get_rubricas_cols(df)
+
 years_all = sorted(df["Ano"].dropna().astype(int).unique())
 if not years_all:
     st.warning("Sem anos válidos no dataset.")
@@ -357,7 +317,7 @@ periodo = st.sidebar.multiselect("Período (anos)", years_all, default=years_all
 df_periodo = df[df["Ano"].astype(int).isin(periodo)].copy()
 df_ref = df[df["Ano"].astype(int) == int(year_ref)].copy()
 
-# KPIs
+# Top KPIs
 c1, c2, c3, c4 = st.columns(4)
 with c1:
     kpi("Ano referência", str(year_ref), "Para Top N e resumo")
@@ -366,12 +326,20 @@ with c2:
 with c3:
     kpi("Anos", str(len(years_all)), f"{years_all[0]}–{years_all[-1]}")
 with c4:
-    kpi("Rubricas (despesa_*)", str(len(rubricas_cols_all)), "Detetadas no dataset")
+    kpi("Rubricas despesa_*", str(len(rubricas_cols_all)), "Detetadas no dataset")
 
 st.divider()
 
 # Menu
-pages = ["Visão Geral", "Despesas", "Peso das despesas (Top N)", "Elasticidades", "ML (igual notebook)", "Agent AI"]
+pages = ["Visão Geral"]
+if col_despesa_total is not None:
+    pages += ["Despesas", "Peso das despesas (Top N)", "Elasticidades (Top 5)", "Previsão SARIMAX (notebook)"]
+if col_segurados is not None:
+    pages += ["Segurados"]
+if col_beneficiarios is not None:
+    pages += ["Beneficiários"]
+pages += ["ML (executar)", "Agent AI (executar)"]
+
 menu = st.sidebar.radio("Menu", pages)
 
 
@@ -383,23 +351,38 @@ if menu == "Visão Geral":
     st.write(f"Registos: **{len(df)}** | Anos: **{len(years_all)}** ({years_all[0]}–{years_all[-1]})")
     st.dataframe(df.head(30), use_container_width=True)
 
-    st.subheader("Colunas-chave (esperadas do notebook)")
-    show_cols = [c for c in ["PIB_WB_USD", "log_PIB_WB_USD", "Inflação", "Segurados", "Beneficiários"] if c in df.columns]
-    st.write({"Encontradas": show_cols, "Rubricas": len(rubricas_cols_all)})
+    st.subheader("Colunas detectadas")
+    st.write(
+        {
+            "despesa_total": col_despesa_total,
+            "segurados": col_segurados,
+            "beneficiarios": col_beneficiarios,
+            "populacao": col_pop,
+            "PIB": col_gdp,
+            "inflacao": col_infl,
+            "População_empregada (notebook)": col_pop_emp,
+            "Pensionista_INPS (notebook)": col_pensionista_inps,
+            "rubricas_despesa_*": len(rubricas_cols_all),
+        }
+    )
 
 elif menu == "Despesas":
     st.header("Despesas")
-    ser = df_periodo.set_index("Ano")["despesa_total"].dropna()
-    safe_line_plot(ser.index, ser.values, "Evolução — despesa_total", "Ano", "Despesa")
-    safe_box_plot(ser.values, "Box — despesa_total (período)", "Despesa")
+    if col_despesa_total is None:
+        st.warning("Não encontrei coluna de despesa_total no dataset.")
+        st.stop()
+
+    d = prepare_period_df(df_periodo, ["Ano", col_despesa_total])
+    ser = d.set_index("Ano")[col_despesa_total]
+    safe_line_plot(ser.index, ser.values, "Evolução — Despesa total", "Ano", "Despesa")
 
     c1, c2 = st.columns(2)
     cagr = calc_cagr(ser)
     yoy = mean_yoy_growth(ser)
     with c1:
-        kpi("CAGR (período)", f"{cagr*100:.2f}%" if cagr is not None else "n/d")
+        kpi("CAGR (período)", f"{cagr*100:.2f}%" if pd.notna(cagr) else "n/d")
     with c2:
-        kpi("Média YoY (período)", f"{yoy*100:.2f}%" if yoy is not None else "n/d")
+        kpi("Média YoY (período)", f"{yoy*100:.2f}%" if pd.notna(yoy) else "n/d")
 
     if rubricas_cols_all:
         st.subheader("Rubricas (despesa_*) — selecione poucas")
@@ -407,7 +390,8 @@ elif menu == "Despesas":
         rubricas_sel = st.multiselect("Rubricas", rubricas_cols_all, default=default_sel)
 
         for c in rubricas_sel:
-            ser_r = df_periodo.set_index("Ano")[c].dropna()
+            d2 = prepare_period_df(df_periodo, ["Ano", c])
+            ser_r = d2.set_index("Ano")[c]
             if ser_r.empty:
                 continue
             st.markdown(f"### {c}")
@@ -418,68 +402,249 @@ elif menu == "Peso das despesas (Top N)":
     if df_ref.empty:
         st.warning("Ano de referência não encontrado no dataset.")
         st.stop()
-
-    topn = st.slider("Top N", 3, 30, 10)
-    out = top_n_weights(df_ref, rubricas_cols_all, "despesa_total", n=topn)
-    st.dataframe(out, use_container_width=True)
-
-elif menu == "Elasticidades":
-    st.header("Elasticidades (Top 5) — igual lógica do notebook (variação % / variação %)")
-    feature_cols = [c for c in ["Segurados", "População_empregada", "Pensionista_INPS", "Inflação", "PIB_WB_USD", "log_PIB_WB_USD"] if c in df_periodo.columns]
-    if not feature_cols:
-        st.info("Não encontrei variáveis numéricas típicas do notebook para elasticidade (ex: Segurados, PIB_WB_USD, etc.).")
+    if col_despesa_total is None:
+        st.warning("Sem despesa_total.")
+        st.stop()
+    if not rubricas_cols_all:
+        st.warning("Não há rubricas despesa_* no dataset.")
         st.stop()
 
-    out = compute_elasticities(df_periodo, "despesa_total", feature_cols, top_n=5)
+    topn = st.slider("Top N", 3, 30, 10)
+    out = top_n_weights(df_ref, rubricas_cols_all, col_despesa_total, n=topn)
+    st.dataframe(out, use_container_width=True)
+
+elif menu == "Elasticidades (Top 5)":
+    st.header("Elasticidades (Top 5) — igual ao notebook (correlação de variações %)")
+
+    if col_despesa_total is None:
+        st.warning("Sem despesa_total.")
+        st.stop()
+
+    d = df_periodo.copy().rename(columns={col_despesa_total: "despesa_total"})
+    # garante mesma base limpa antes do cálculo
+    d = prepare_period_df(d, ["Ano", "despesa_total"])
+
+    out = elasticidade_aproximada_notebook(d, variavel_alvo="despesa_total", col_ano="Ano", top_n=5)
     if out.empty:
         st.info("Não foi possível calcular elasticidades (dados insuficientes / variação nula).")
     else:
         st.dataframe(out, use_container_width=True)
 
-elif menu == "ML (igual notebook)":
-    st.header("ML — igual ao notebook (baseline lag1 + Ridge/Lasso/RF com CV temporal)")
+        fig, ax = plt.subplots()
+        ax.barh(out["Variável"], out["Elasticidade_aprox"])
+        ax.axvline(0, linestyle="--", alpha=0.3)
+        ax.set_xlabel("Elasticidade aproximada (correlação de %Δ)")
+        ax.set_title("Top 5 — Elasticidade aproximada (notebook)")
+        ax.grid(True, axis="x", alpha=0.2)
+        st.pyplot(fig)
 
-    test_years = st.slider("Quantos anos usar como teste (últimos N)?", 2, 6, 3)
+elif menu == "Segurados":
+    st.header("Segurados")
+    if col_segurados is None:
+        st.warning("Sem coluna de Segurados.")
+        st.stop()
+    d = prepare_period_df(df_periodo, ["Ano", col_segurados])
+    ser = d.set_index("Ano")[col_segurados]
+    safe_line_plot(ser.index, ser.values, "Evolução — Segurados", "Ano", "Segurados")
 
-    run = st.button("Rodar ML")
-    if not run:
-        st.info("Clique em **Rodar ML** para executar (leve).")
+elif menu == "Beneficiários":
+    st.header("Beneficiários")
+    if col_beneficiarios is None:
+        st.warning("Sem coluna de Beneficiários.")
+        st.stop()
+    d = prepare_period_df(df_periodo, ["Ano", col_beneficiarios])
+    ser = d.set_index("Ano")[col_beneficiarios]
+    safe_line_plot(ser.index, ser.values, "Evolução — Beneficiários", "Ano", "Beneficiários")
+
+elif menu == "Previsão SARIMAX (notebook)":
+    st.header("Previsão de Despesa Total com SARIMAX ")
+
+    if col_despesa_total is None:
+        st.warning("Sem despesa_total.")
+        st.stop()
+
+    # Exógenas do notebook (precisa das 3)
+    exog_cols = []
+    if col_segurados is not None:
+        exog_cols.append(col_segurados)
+    if col_pop_emp is not None:
+        exog_cols.append(col_pop_emp)
+    if col_pensionista_inps is not None:
+        exog_cols.append(col_pensionista_inps)
+
+    if len(exog_cols) < 3:
+        st.error(
+            "Para ficar IGUAL ao notebook, o dataset precisa destas colunas:\n"
+            "- Segurados\n- População_empregada\n- Pensionista_INPS\n\n"
+            f"Detectadas agora: {exog_cols}"
+        )
+        st.stop()
+
+    d = df_periodo[["Ano", col_despesa_total] + exog_cols].copy()
+    d = d.rename(columns={col_despesa_total: "despesa_total"})
+    d = prepare_period_df(d, ["Ano", "despesa_total"] + exog_cols)
+
+    if len(d) < 8:
+        st.info("Série curta para SARIMAX. Selecione mais anos no filtro de período.")
+        st.stop()
+
+    ultimo_ano = int(d["Ano"].max())
+    ano_fim = st.slider(
+        "Prever até ao ano",
+        min_value=ultimo_ano + 1,
+        max_value=ultimo_ano + 20,
+        value=max(ultimo_ano + 6, ultimo_ano + 1),
+    )
+    steps = int(ano_fim - ultimo_ano)
+
+    st.caption(
+        f"Ajuste: SARIMAX(1,1,1) | Exógenas: {exog_cols} | "
+        f"Base: {int(d['Ano'].min())}–{ultimo_ano} | Passos: {steps}"
+    )
+
+    safe_line_plot(d["Ano"], d["despesa_total"], "Histórico (despesa_total)", "Ano", "Despesa total")
+
+    run_btn = st.button("Gerar previsão SARIMAX")
+    if not run_btn:
+        st.info("Clique em **Gerar previsão SARIMAX** para executar.")
+        st.stop()
+
+    y = d["despesa_total"].to_numpy(dtype=float)
+    exog_hist = d[exog_cols].to_numpy(dtype=float)
+
+    try:
+        res = fit_sarimax(y, exog_hist)
+    except Exception as e:
+        st.error(f"Erro ao ajustar SARIMAX: {e}")
+        st.stop()
+
+    exog_future_df = build_exog_future_from_mean_growth(d, exog_cols, steps=steps)
+    if exog_future_df.isna().any().any():
+        st.error("Falha ao projetar exógenas futuras (há NaN). Verifica valores finais das colunas exógenas.")
         st.stop()
 
     try:
-        out = run_ml_like_notebook(df_periodo, target_col="despesa_total", year_col="Ano", test_years=test_years)
+        fc_mean, ci_low, ci_high = forecast_sarimax_with_ci(res, exog_future_df.to_numpy(dtype=float), steps=steps)
     except Exception as e:
-        st.error(f"Falha no ML: {e}")
+        st.error(f"Erro ao prever com SARIMAX: {e}")
         st.stop()
 
-    st.subheader("Resultados (RMSE menor = melhor)")
-    st.dataframe(out["res_df"], use_container_width=True)
-    st.success(f"Melhor modelo (RMSE): **{out['best_name']}**")
+    anos_previstos = list(range(ultimo_ano + 1, ultimo_ano + steps + 1))
 
-    # Real vs previsto (teste temporal)
-    test = out["test"]
-    fig = plt.figure(figsize=(10, 4))
-    plt.plot(test["Ano"].values, out["y_test"], marker="o", label="Real")
-    plt.plot(test["Ano"].values, out["pred_best"], marker="o", label="Previsto")
-    plt.legend()
-    plt.xlabel("Ano")
-    plt.ylabel("despesa_total")
-    plt.title("Real vs Previsto (teste temporal)")
-    st.pyplot(fig, clear_figure=True)
+    st.subheader("Tabela de previsão (IC 95%)")
+    out = pd.DataFrame(
+        {
+            "Ano": anos_previstos,
+            "Previsão": fc_mean,
+            "IC_95_inf": ci_low,
+            "IC_95_sup": ci_high,
+        }
+    )
+    st.dataframe(out, use_container_width=True)
 
-    # Guardar para Agent AI
-    st.session_state["ml_results_df"] = out["res_df"]
+    st.subheader("Gráfico (histórico + previsão + IC)")
+    fig, ax = plt.subplots(figsize=(12, 5))
+    ax.plot(d["Ano"], d["despesa_total"], marker="o", label="Observado")
+    ax.plot(anos_previstos, fc_mean, marker="o", linestyle="--", label="Previsto (SARIMAX)")
+    ax.fill_between(anos_previstos, ci_low, ci_high, alpha=0.2, label="IC 95%")
+    ax.set_xlabel("Ano")
+    ax.set_ylabel("Despesa Total")
+    ax.set_title("Previsão de Despesa Total — SARIMAX(1,1,1) (notebook)")
+    ax.grid(alpha=0.3)
+    ax.legend()
+    st.pyplot(fig)
 
-elif menu == "Agent AI":
-    st.header("Agent AI — diagnóstico automático (baseado no dataset e no ML)")
+elif menu == "ML (executar)":
+    st.header("ML — comparação de modelos (executar)")
 
-    base = df_periodo[["Ano", "despesa_total"]].copy()
-    res_df = st.session_state.get("ml_results_df", None)
+    if col_despesa_total is None:
+        st.warning("Sem despesa_total.")
+        st.stop()
 
-    agent_out = run_agent(base, results_df=res_df)
+    feature_candidates = [col_pop, col_gdp, col_infl, col_segurados]
+    feature_cols = [c for c in feature_candidates if c is not None]
+    if not feature_cols:
+        st.info("Sem variáveis (Pop/PIB/Inflação/Segurados) para treinar modelos.")
+        st.stop()
+
+    test_years = st.slider("Anos no teste (últimos N anos)", 1, 6, 3)
+
+    run = st.button("Rodar comparação (ML)")
+    if not run:
+        st.info("Clique em **Rodar comparação (ML)** para executar.")
+        st.stop()
+
+    results, _test_df_out, _preds, _test_set = compare_models(
+        df_periodo,
+        feature_cols=feature_cols,
+        target_col=col_despesa_total,
+        year_col="Ano",
+        test_years=test_years,
+    )
+
+    st.subheader("Resultados (holdout temporal)")
+    st.dataframe(results, use_container_width=True)
+
+    st.subheader("Resultados CV (TimeSeriesSplit)")
+    cv = time_series_cv_rmse(
+        df_periodo,
+        feature_cols=feature_cols,
+        target_col=col_despesa_total,
+        year_col="Ano",
+        n_splits=min(4, max(2, len(df_periodo) - 2)),
+    )
+    st.dataframe(cv, use_container_width=True)
+
+    st.subheader("Agent AI (com base nos resultados ML)")
+    base = df_periodo[["Ano", col_despesa_total]].rename(columns={col_despesa_total: "despesa_total"}).copy()
+
+    agent_out = run_agent(base, results_df=results)
     report_md = agent_out.get("report_md", "")
 
-    st.markdown(report_md if report_md else "Sem relatório (report_md vazio).")
+    report_path = ROOT_DIR / "reports" / "agent_report.md"
+    save_report_md(report_md, report_path)
 
-    if agent_out.get("best_model"):
-        st.info(f"Recomendação do agente: **{agent_out.get('best_model')}**")
+    st.markdown(report_md)
+
+    st.download_button(
+        "Baixar relatório (.md)",
+        data=report_md.encode("utf-8"),
+        file_name="agent_report.md",
+        mime="text/markdown",
+    )
+
+elif menu == "Agent AI (executar)":
+    st.header("Agent AI — Diagnóstico Automático (executar)")
+
+    if col_despesa_total is None:
+        st.warning("Sem despesa_total para analisar.")
+        st.stop()
+
+    base = df_periodo[["Ano", col_despesa_total]].rename(columns={col_despesa_total: "despesa_total"}).copy()
+    report_path = ROOT_DIR / "reports" / "agent_report.md"
+
+    use_cached = st.checkbox("Mostrar último relatório salvo (sem recalcular)", value=True)
+
+    if use_cached and report_path.exists():
+        st.info("A mostrar o último relatório salvo.")
+        st.markdown(report_path.read_text(encoding="utf-8"))
+    else:
+        run_agent_btn = st.button("Gerar relatório do Agent")
+        if not run_agent_btn:
+            st.info("Clique em **Gerar relatório do Agent** para executar.")
+            st.stop()
+
+        agent_out = run_agent(base, results_df=None)
+        report_md = agent_out.get("report_md", "")
+
+        save_report_md(report_md, report_path)
+
+        st.success("Relatório gerado e guardado em reports/agent_report.md")
+        st.markdown(report_md)
+
+        st.download_button(
+            "Baixar relatório (.md)",
+            data=report_md.encode("utf-8"),
+            file_name="agent_report.md",
+            mime="text/markdown",
+        )
