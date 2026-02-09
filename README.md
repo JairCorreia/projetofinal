@@ -1,7 +1,7 @@
-# Projeto Final G3 — Análise Económica e de Despesa em Saúde 
+# Análise Económica e de Despesa em Saúde 
 ## 📌 Visão Geral do Projeto
 
-Este projeto foi desenvolvido para **analisar, integrar e modelar dados económicos e de saúde**, com especial foco na **despesa em medicamentos**, permitindo:
+Este projeto foi desenvolvido para analisar, integrar e modelar dados macroeconómicos e das despesas do ramo doença e maternidade, permitindo:
 
 - Compreender a evolução temporal da despesa  
 - Relacionar custos com variáveis macroeconómicas  
