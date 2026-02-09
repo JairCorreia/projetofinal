@@ -414,14 +414,14 @@ elif menu == "Peso das despesas (Top N)":
     st.dataframe(out, use_container_width=True)
 
 elif menu == "Elasticidades (Top 5)":
-    st.header("Elasticidades (Top 5) — igual ao notebook (correlação de variações %)")
+    # ✅ ALTERAÇÃO PEDIDA: remover "igual ao notebook"
+    st.header("Elasticidades (Top 5) — correlação de variações (%)")
 
     if col_despesa_total is None:
         st.warning("Sem despesa_total.")
         st.stop()
 
     d = df_periodo.copy().rename(columns={col_despesa_total: "despesa_total"})
-    # garante mesma base limpa antes do cálculo
     d = prepare_period_df(d, ["Ano", "despesa_total"])
 
     out = elasticidade_aproximada_notebook(d, variavel_alvo="despesa_total", col_ano="Ano", top_n=5)
@@ -434,7 +434,8 @@ elif menu == "Elasticidades (Top 5)":
         ax.barh(out["Variável"], out["Elasticidade_aprox"])
         ax.axvline(0, linestyle="--", alpha=0.3)
         ax.set_xlabel("Elasticidade aproximada (correlação de %Δ)")
-        ax.set_title("Top 5 — Elasticidade aproximada (notebook)")
+        # ✅ ALTERAÇÃO PEDIDA: remover "(notebook)"
+        ax.set_title("Top 5 — Elasticidade aproximada")
         ax.grid(True, axis="x", alpha=0.2)
         st.pyplot(fig)
 
