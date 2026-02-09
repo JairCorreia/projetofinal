@@ -1,5 +1,4 @@
-# Projeto Final G3 — Análise Económica e de Saúde (Despesa em Medicamentos)
-
+# Projeto Final G3 — Análise Económica e de Despesa em Saúde 
 ## 📌 Visão Geral do Projeto
 
 Este projeto foi desenvolvido para **analisar, integrar e modelar dados económicos e de saúde**, com especial foco na **despesa em medicamentos**, permitindo:
