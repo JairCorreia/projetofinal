@@ -1,7 +1,12 @@
 # app/streamlit_app.py
 # ============================================================
-# DASHBOARD 
-#
+# DASHBOARD (baseado no teu código) — Ajustes pedidos:
+# ✅ Remover BOX do "Segurados" (fica só a linha)
+# ✅ Elasticidades: TOP 5 fixo (igual ao notebook)
+# ✅ Elasticidade "aproximada" (extra) calculada também por regressão
+#    em log-diferenças (mais estável), MAS mantendo a elasticidade do notebook
+#    como "Elasticidade_média (pct/pct)".
+# ============================================================
 
 import sys
 from pathlib import Path
@@ -82,7 +87,7 @@ def safe_box_plot(values, title, ylabel):
 
 # ----------------------------
 # Data helpers
-# ----------------------------s
+# ----------------------------
 @st.cache_data
 def load_data(csv_path: str) -> pd.DataFrame:
     df = pd.read_csv(csv_path)
@@ -115,7 +120,7 @@ def get_rubricas_cols(df: pd.DataFrame) -> list[str]:
 
 
 def calc_cagr(series: pd.Series) -> float | None:
-    s = series.dropna()
+    s = pd.to_numeric(series, errors="coerce").dropna()
     if len(s) < 2:
         return None
     vi = float(s.iloc[0])
@@ -127,10 +132,10 @@ def calc_cagr(series: pd.Series) -> float | None:
 
 
 def mean_yoy_growth(series: pd.Series) -> float | None:
-    s = series.dropna()
+    s = pd.to_numeric(series, errors="coerce").dropna()
     if len(s) < 2:
         return None
-    yoy = s.pct_change().dropna()
+    yoy = s.pct_change().replace([np.inf, -np.inf], np.nan).dropna()
     if yoy.empty:
         return None
     return float(yoy.mean())
@@ -149,33 +154,98 @@ def top_n_weights(df_ref: pd.DataFrame, rubricas: list[str], total_col: str, n: 
     return out
 
 
+# --- Elasticidades (igual notebook) + elasticidade aproximada ---
+def _elasticidade_pct_pct(d: pd.DataFrame, target_col: str, feature_col: str) -> tuple[float | None, int]:
+    """
+    Igual ao notebook: elasticidade média ~ mean( Δ%Y / Δ%X )
+    """
+    t = pd.to_numeric(d[target_col], errors="coerce").replace([np.inf, -np.inf], np.nan)
+    x = pd.to_numeric(d[feature_col], errors="coerce").replace([np.inf, -np.inf], np.nan)
+
+    t_pct = t.pct_change().replace([np.inf, -np.inf], np.nan)
+    x_pct = x.pct_change().replace([np.inf, -np.inf], np.nan)
+
+    ratio = (t_pct / x_pct).replace([np.inf, -np.inf], np.nan).dropna()
+    if ratio.empty:
+        return None, 0
+    return float(ratio.mean()), int(ratio.shape[0])
+
+
+def _elasticidade_aprox_logdiff(d: pd.DataFrame, target_col: str, feature_col: str) -> tuple[float | None, int]:
+    """
+    Elasticidade aproximada (mais estável):
+    beta ~ regressão simples em log-diferenças:
+      Δlog(Y) = beta * Δlog(X) + erro
+    """
+    y = pd.to_numeric(d[target_col], errors="coerce").replace([np.inf, -np.inf], np.nan)
+    x = pd.to_numeric(d[feature_col], errors="coerce").replace([np.inf, -np.inf], np.nan)
+
+    # precisa de valores positivos para log
+    y = y.where(y > 0)
+    x = x.where(x > 0)
+
+    dy = np.log(y).diff()
+    dx = np.log(x).diff()
+
+    m = pd.concat([dx, dy], axis=1).dropna()
+    if m.shape[0] < 3:
+        return None, int(m.shape[0])
+
+    dxv = m.iloc[:, 0].values
+    dyv = m.iloc[:, 1].values
+
+    # beta = cov(dx,dy)/var(dx)
+    var = float(np.var(dxv))
+    if var == 0.0:
+        return None, int(m.shape[0])
+
+    beta = float(np.cov(dxv, dyv, bias=True)[0, 1] / var)
+    return beta, int(m.shape[0])
+
+
 def compute_elasticities(df_periodo: pd.DataFrame, target_col: str, feature_cols: list[str], top_n: int = 5):
+    """
+    Retorna TOP N por |Elasticidade_média| (igual notebook),
+    mas inclui também Elasticidade_aprox (log-diff) como coluna extra.
+    """
     d = df_periodo.sort_values("Ano").copy()
     if len(d) < 4:
         return pd.DataFrame()
-
-    t = d[target_col].astype(float).replace([np.inf, -np.inf], np.nan)
-    t_pct = t.pct_change().replace([np.inf, -np.inf], np.nan)
 
     rows = []
     for f in feature_cols:
         if f not in d.columns:
             continue
-        x = d[f].astype(float).replace([np.inf, -np.inf], np.nan)
-        x_pct = x.pct_change().replace([np.inf, -np.inf], np.nan)
-        ratio = (t_pct / x_pct).replace([np.inf, -np.inf], np.nan).dropna()
-        if ratio.empty:
+
+        e_mean, n1 = _elasticidade_pct_pct(d, target_col, f)
+        e_apx, n2 = _elasticidade_aprox_logdiff(d, target_col, f)
+
+        if e_mean is None and e_apx is None:
             continue
-        rows.append({"Variável": f, "Elasticidade_média": float(ratio.mean()), "N": int(ratio.shape[0])})
+
+        rows.append(
+            {
+                "Variável": f,
+                "Elasticidade_média (pct/pct)": e_mean,
+                "N (pct/pct)": n1,
+                "Elasticidade_aprox (log-diff)": e_apx,
+                "N (log-diff)": n2,
+            }
+        )
 
     if not rows:
         return pd.DataFrame()
 
-    out = (
-        pd.DataFrame(rows)
-        .sort_values("Elasticidade_média", key=lambda s: s.abs(), ascending=False)
-        .head(top_n)
-    )
+    out = pd.DataFrame(rows)
+    # ranking igual notebook: por abs(elasticidade média pct/pct)
+    # se pct/pct for None, usa aprox só para preencher, mas ranking mantém a lógica original
+    rank_series = out["Elasticidade_média (pct/pct)"].copy()
+    rank_series = rank_series.where(rank_series.notna(), out["Elasticidade_aprox (log-diff)"])
+    out["_rank_abs"] = rank_series.abs()
+
+    out = out.sort_values("_rank_abs", ascending=False).drop(columns=["_rank_abs"]).head(top_n)
+
+    # deixar mais "limpo"
     return out
 
 
@@ -251,7 +321,7 @@ st.divider()
 pages = ["Visão Geral"]
 
 if col_despesa_total is not None:
-    pages += ["Despesas", "Peso das despesas (Top N)", "Elasticidades"]
+    pages += ["Despesas", "Peso das despesas (Top N)", "Elasticidades (Top 5)"]
 
 if col_segurados is not None:
     pages += ["Segurados"]
@@ -340,28 +410,38 @@ elif menu == "Peso das despesas (Top N)":
     out = top_n_weights(df_ref, rubricas_cols_all, col_despesa_total, n=topn)
     st.dataframe(out, use_container_width=True)
 
-elif menu == "Elasticidades":
-    st.header("Elasticidades (Top 5)")
+elif menu == "Elasticidades (Top 5)":
+    st.header("Elasticidades — TOP 5 (igual notebook) + Aproximada")
+
     if col_despesa_total is None:
         st.warning("Sem despesa_total.")
         st.stop()
 
+    # Igual ao teu código: usa Pop/PIB/Inflação/Segurados se existirem
     feature_cols = [c for c in [col_pop, col_gdp, col_infl, col_segurados] if c is not None]
     if not feature_cols:
         st.info("Sem variáveis (Pop/PIB/Inflação/Segurados) para calcular elasticidades.")
         st.stop()
 
+    # TOP 5 fixo
     out = compute_elasticities(df_periodo, col_despesa_total, feature_cols, top_n=5)
+
     if out.empty:
         st.info("Não foi possível calcular elasticidades (dados insuficientes / variação nula).")
     else:
+        st.caption(
+            "• **Elasticidade_média (pct/pct)** = média de (Δ% despesa / Δ% variável) — igual notebook.\n"
+            "• **Elasticidade_aprox (log-diff)** = regressão em log-diferenças (mais estável quando há ruído)."
+        )
         st.dataframe(out, use_container_width=True)
 
 elif menu == "Segurados":
     st.header("Segurados")
     ser = df_periodo.set_index("Ano")[col_segurados].dropna()
     safe_line_plot(ser.index, ser.values, "Evolução — Segurados", "Ano", "Segurados")
-    safe_box_plot(ser.values, "Box — Segurados (período)", "Segurados")
+
+    # ✅ pedido: remover BOX no Segurados (não mostrar)
+    st.info("Boxplot removido conforme solicitado (fica apenas a evolução por ano).")
 
 elif menu == "Beneficiários":
     st.header("Beneficiários")
@@ -415,7 +495,10 @@ elif menu == "Previsões (executar)":
             test_years=1,
         )
     except TypeError:
-        st.error("A função train_test_split_time do teu src/time_series.py tem assinatura diferente. Ajusta para year_col/target/test_years.")
+        st.error(
+            "A função train_test_split_time do teu src/time_series.py tem assinatura diferente. "
+            "Ajusta para year_col/target/test_years."
+        )
         st.stop()
 
     if method == "ARIMA":
@@ -483,11 +566,9 @@ elif menu == "ML (executar)":
     st.subheader("Agent AI (com base nos resultados ML)")
     base = df_periodo[["Ano", col_despesa_total]].rename(columns={col_despesa_total: "despesa_total"}).copy()
 
-    #  OPÇÃO A: não passa save_path
     agent_out = run_agent(base, results_df=results)
     report_md = agent_out.get("report_md", "")
 
-    # salva manualmente
     report_path = ROOT_DIR / "reports" / "agent_report.md"
     save_report_md(report_md, report_path)
 
@@ -521,11 +602,9 @@ elif menu == "Agent AI (executar)":
             st.info("Clique em **Gerar relatório do Agent** para executar.")
             st.stop()
 
-        #  OPÇÃO A: não passa save_path
         agent_out = run_agent(base, results_df=None)
         report_md = agent_out.get("report_md", "")
 
-        # salva manualmente
         save_report_md(report_md, report_path)
 
         st.success("Relatório gerado e guardado em reports/agent_report.md")
