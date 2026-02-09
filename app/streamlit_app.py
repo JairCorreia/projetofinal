@@ -1,19 +1,20 @@
 # app/streamlit_app.py
 # ============================================================
-# DASHBOARD (baseado no teu código) — Ajustes pedidos:
-# ✅ Remover BOX do "Segurados" (fica só a linha)
-# ✅ Elasticidades: TOP 5 fixo (igual ao notebook)
-# ✅ Elasticidade "aproximada" (extra) calculada também por regressão
-#    em log-diferenças (mais estável), MAS mantendo a elasticidade do notebook
-#    como "Elasticidade_média (pct/pct)".
+# DASHBOARD  (alinhado com o notebook)
+# - sem boxplot
+# - elasticidade aproximada (correlação de variações %)
+# - previsão SARIMAX(1,1,1) com exógenas e projeção até ano alvo
 # ============================================================
 
 import sys
 from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
+
+from statsmodels.tsa.statespace.sarimax import SARIMAX
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
@@ -21,7 +22,6 @@ if str(ROOT_DIR) not in sys.path:
 
 # IMPORTS DA TUA CAMADA src/
 from src.agent_ai import run_agent
-from src.time_series import train_test_split_time, forecast_arima, forecast_ets
 from src.ml import compare_models, time_series_cv_rmse
 
 
@@ -76,15 +76,6 @@ def safe_line_plot(x, y, title, xlabel, ylabel):
     st.pyplot(fig)
 
 
-def safe_box_plot(values, title, ylabel):
-    fig, ax = plt.subplots()
-    ax.boxplot(values, vert=True)
-    ax.set_title(title)
-    ax.set_ylabel(ylabel)
-    ax.grid(True, alpha=0.3)
-    st.pyplot(fig)
-
-
 # ----------------------------
 # Data helpers
 # ----------------------------
@@ -120,22 +111,22 @@ def get_rubricas_cols(df: pd.DataFrame) -> list[str]:
 
 
 def calc_cagr(series: pd.Series) -> float | None:
-    s = pd.to_numeric(series, errors="coerce").dropna()
+    s = series.dropna()
     if len(s) < 2:
         return None
     vi = float(s.iloc[0])
     vf = float(s.iloc[-1])
-    n = len(s)
     if vi <= 0 or vf <= 0:
         return None
+    n = len(s)
     return (vf / vi) ** (1 / (n - 1)) - 1
 
 
 def mean_yoy_growth(series: pd.Series) -> float | None:
-    s = pd.to_numeric(series, errors="coerce").dropna()
+    s = series.dropna()
     if len(s) < 2:
         return None
-    yoy = s.pct_change().replace([np.inf, -np.inf], np.nan).dropna()
+    yoy = s.pct_change().dropna()
     if yoy.empty:
         return None
     return float(yoy.mean())
@@ -154,104 +145,90 @@ def top_n_weights(df_ref: pd.DataFrame, rubricas: list[str], total_col: str, n: 
     return out
 
 
-# --- Elasticidades (igual notebook) + elasticidade aproximada ---
-def _elasticidade_pct_pct(d: pd.DataFrame, target_col: str, feature_col: str) -> tuple[float | None, int]:
-    """
-    Igual ao notebook: elasticidade média ~ mean( Δ%Y / Δ%X )
-    """
-    t = pd.to_numeric(d[target_col], errors="coerce").replace([np.inf, -np.inf], np.nan)
-    x = pd.to_numeric(d[feature_col], errors="coerce").replace([np.inf, -np.inf], np.nan)
+# --- Elasticidade aproximada (IGUAL ao notebook: correlação de variações percentuais)
+def elasticidade_aproximada_notebook(
+    df_in: pd.DataFrame,
+    variavel_alvo: str = "despesa_total",
+    col_ano: str = "Ano",
+    top_n: int = 5,
+) -> pd.DataFrame:
+    d = df_in.copy()
 
-    t_pct = t.pct_change().replace([np.inf, -np.inf], np.nan)
-    x_pct = x.pct_change().replace([np.inf, -np.inf], np.nan)
+    # só numéricas, exclui ano e alvo
+    variaveis = [
+        v for v in d.columns
+        if v not in [col_ano, variavel_alvo]
+        and pd.api.types.is_numeric_dtype(d[v])
+    ]
 
-    ratio = (t_pct / x_pct).replace([np.inf, -np.inf], np.nan).dropna()
-    if ratio.empty:
-        return None, 0
-    return float(ratio.mean()), int(ratio.shape[0])
+    elasticidade = []
+    for var in variaveis:
+        tmp = d[[variavel_alvo, var]].dropna().copy()
 
+        tmp[f"{var}_pct"] = pd.to_numeric(tmp[var], errors="coerce").pct_change()
+        tmp[f"{variavel_alvo}_pct"] = pd.to_numeric(tmp[variavel_alvo], errors="coerce").pct_change()
 
-def _elasticidade_aprox_logdiff(d: pd.DataFrame, target_col: str, feature_col: str) -> tuple[float | None, int]:
-    """
-    Elasticidade aproximada (mais estável):
-    beta ~ regressão simples em log-diferenças:
-      Δlog(Y) = beta * Δlog(X) + erro
-    """
-    y = pd.to_numeric(d[target_col], errors="coerce").replace([np.inf, -np.inf], np.nan)
-    x = pd.to_numeric(d[feature_col], errors="coerce").replace([np.inf, -np.inf], np.nan)
+        tmp = tmp.replace([np.inf, -np.inf], np.nan).dropna()
 
-    # precisa de valores positivos para log
-    y = y.where(y > 0)
-    x = x.where(x > 0)
+        if len(tmp) > 2:
+            corr = tmp[f"{var}_pct"].corr(tmp[f"{variavel_alvo}_pct"])
+            elasticidade.append({"Variável": var, "Elasticidade_aprox": float(corr)})
 
-    dy = np.log(y).diff()
-    dx = np.log(x).diff()
-
-    m = pd.concat([dx, dy], axis=1).dropna()
-    if m.shape[0] < 3:
-        return None, int(m.shape[0])
-
-    dxv = m.iloc[:, 0].values
-    dyv = m.iloc[:, 1].values
-
-    # beta = cov(dx,dy)/var(dx)
-    var = float(np.var(dxv))
-    if var == 0.0:
-        return None, int(m.shape[0])
-
-    beta = float(np.cov(dxv, dyv, bias=True)[0, 1] / var)
-    return beta, int(m.shape[0])
-
-
-def compute_elasticities(df_periodo: pd.DataFrame, target_col: str, feature_cols: list[str], top_n: int = 5):
-    """
-    Retorna TOP N por |Elasticidade_média| (igual notebook),
-    mas inclui também Elasticidade_aprox (log-diff) como coluna extra.
-    """
-    d = df_periodo.sort_values("Ano").copy()
-    if len(d) < 4:
+    if not elasticidade:
         return pd.DataFrame()
 
-    rows = []
-    for f in feature_cols:
-        if f not in d.columns:
-            continue
-
-        e_mean, n1 = _elasticidade_pct_pct(d, target_col, f)
-        e_apx, n2 = _elasticidade_aprox_logdiff(d, target_col, f)
-
-        if e_mean is None and e_apx is None:
-            continue
-
-        rows.append(
-            {
-                "Variável": f,
-                "Elasticidade_média (pct/pct)": e_mean,
-                "N (pct/pct)": n1,
-                "Elasticidade_aprox (log-diff)": e_apx,
-                "N (log-diff)": n2,
-            }
-        )
-
-    if not rows:
-        return pd.DataFrame()
-
-    out = pd.DataFrame(rows)
-    # ranking igual notebook: por abs(elasticidade média pct/pct)
-    # se pct/pct for None, usa aprox só para preencher, mas ranking mantém a lógica original
-    rank_series = out["Elasticidade_média (pct/pct)"].copy()
-    rank_series = rank_series.where(rank_series.notna(), out["Elasticidade_aprox (log-diff)"])
-    out["_rank_abs"] = rank_series.abs()
-
-    out = out.sort_values("_rank_abs", ascending=False).drop(columns=["_rank_abs"]).head(top_n)
-
-    # deixar mais "limpo"
+    out = (
+        pd.DataFrame(elasticidade)
+        .sort_values("Elasticidade_aprox", key=lambda s: s.abs(), ascending=False)
+        .head(top_n)
+        .reset_index(drop=True)
+    )
     return out
 
 
 def save_report_md(report_md: str, report_path: Path) -> None:
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(report_md or "", encoding="utf-8")
+
+
+# --- Previsão SARIMAX (igual ao notebook)
+def build_exog_future_from_mean_growth(df_hist: pd.DataFrame, exog_cols: list[str], steps: int) -> pd.DataFrame:
+    """
+    Projeta exógenas para o futuro como no notebook:
+    exog_future[var] = last_value * (1 + mean_growth)**i
+    onde mean_growth é a média do pct_change histórico.
+    """
+    d = df_hist[exog_cols].copy()
+    d = d.apply(pd.to_numeric, errors="coerce")
+    growth = d.pct_change().mean(numeric_only=True)
+
+    last = d.iloc[-1]
+    fut = {}
+    for c in exog_cols:
+        g = float(growth.get(c, 0.0)) if pd.notna(growth.get(c, np.nan)) else 0.0
+        lv = float(last.get(c, np.nan))
+        if pd.isna(lv):
+            # se faltar, mantém NaN (o SARIMAX vai falhar -> tratamos antes)
+            fut[c] = [np.nan] * steps
+        else:
+            fut[c] = [lv * (1 + g) ** i for i in range(1, steps + 1)]
+
+    return pd.DataFrame(fut)
+
+
+@st.cache_resource
+def fit_sarimax(y: np.ndarray, exog: np.ndarray):
+    # Igual ao notebook: SARIMAX com order(1,1,1) e sem restrições
+    model = SARIMAX(
+        y,
+        order=(1, 1, 1),
+        seasonal_order=(0, 0, 0, 0),
+        exog=exog,
+        enforce_stationarity=False,
+        enforce_invertibility=False,
+    )
+    res = model.fit(disp=False)
+    return res
 
 
 # ----------------------------
@@ -270,7 +247,7 @@ st.sidebar.caption("Dashboard • ML • Agent AI")
 # ----------------------------
 # Load dataset
 # ----------------------------
-st.title("📊  Dashboard ")
+st.title("📊 Dashboard")
 
 default_csv = str(ROOT_DIR / "data" / "processed" / "dataset_merge_wb_gdp.csv")
 csv_path = st.sidebar.text_input("Caminho do CSV (data/processed)", value=default_csv)
@@ -281,13 +258,17 @@ except Exception as e:
     st.error(f"Erro ao carregar dataset: {e}")
     st.stop()
 
-# Detect columns
+# Detect columns (mantém o teu)
 col_despesa_total = detect_col(df, ["despesa_total", "Despesa_Total", "total_despesa", "Total_Despesa"])
 col_segurados = detect_col(df, ["Segurados", "segurados"])
 col_beneficiarios = detect_col(df, ["Beneficiarios", "Beneficiários", "beneficiarios", "beneficiários"])
 col_pop = detect_col(df, ["Populacao", "População", "populacao", "população"])
 col_gdp = detect_col(df, ["PIB", "NY.GDP.MKTP.CD", "gdp", "GDP"])
 col_infl = detect_col(df, ["Inflacao", "Inflação", "inflacao", "inflação"])
+
+# Colunas específicas do notebook (para SARIMAX exógeno)
+col_pop_emp = detect_col(df, ["População_empregada", "Populacao_empregada", "populacao_empregada"])
+col_pensionista_inps = detect_col(df, ["Pensionista_INPS", "pensionista_inps"])
 
 rubricas_cols_all = get_rubricas_cols(df)
 
@@ -328,11 +309,8 @@ if col_segurados is not None:
 if col_beneficiarios is not None:
     pages += ["Beneficiários"]
 
-has_sdo = "despesa_SDO" in df_periodo.columns
-has_mat = "despesa_MATERNIDADE" in df_periodo.columns
-has_any_series = (col_despesa_total is not None) or (has_sdo and has_mat)
-if has_any_series:
-    pages += ["Previsões (executar)"]
+if col_despesa_total is not None:
+    pages += ["Previsão SARIMAX (igual ao notebook)"]
 
 pages += ["ML (executar)", "Agent AI (executar)"]
 
@@ -356,6 +334,8 @@ if menu == "Visão Geral":
             "populacao": col_pop,
             "PIB": col_gdp,
             "inflacao": col_infl,
+            "População_empregada (notebook)": col_pop_emp,
+            "Pensionista_INPS (notebook)": col_pensionista_inps,
             "rubricas_despesa_*": len(rubricas_cols_all),
         }
     )
@@ -368,12 +348,10 @@ elif menu == "Despesas":
 
     ser = df_periodo.set_index("Ano")[col_despesa_total].dropna()
     safe_line_plot(ser.index, ser.values, "Evolução — Despesa total", "Ano", "Despesa")
-    safe_box_plot(ser.values, "Box — Despesa total (período)", "Despesa")
 
     c1, c2 = st.columns(2)
     cagr = calc_cagr(ser)
     yoy = mean_yoy_growth(ser)
-
     with c1:
         kpi("CAGR (período)", f"{cagr*100:.2f}%" if pd.notna(cagr) else "n/d")
     with c2:
@@ -411,116 +389,152 @@ elif menu == "Peso das despesas (Top N)":
     st.dataframe(out, use_container_width=True)
 
 elif menu == "Elasticidades (Top 5)":
-    st.header("Elasticidades — TOP 5 (igual notebook) + Aproximada")
+    st.header("Elasticidades (Top 5) — Elasticidade aproximada (igual ao notebook)")
 
     if col_despesa_total is None:
         st.warning("Sem despesa_total.")
         st.stop()
 
-    # Igual ao teu código: usa Pop/PIB/Inflação/Segurados se existirem
-    feature_cols = [c for c in [col_pop, col_gdp, col_infl, col_segurados] if c is not None]
-    if not feature_cols:
-        st.info("Sem variáveis (Pop/PIB/Inflação/Segurados) para calcular elasticidades.")
-        st.stop()
+    # notebook calcula elasticidade aproximada para TODAS numéricas (exceto ano e alvo)
+    base_cols = ["Ano", col_despesa_total]
+    d = df_periodo[base_cols + [c for c in df_periodo.columns if c not in base_cols]].copy()
+    d = d.rename(columns={col_despesa_total: "despesa_total"})
 
-    # TOP 5 fixo
-    out = compute_elasticities(df_periodo, col_despesa_total, feature_cols, top_n=5)
-
+    out = elasticidade_aproximada_notebook(d, variavel_alvo="despesa_total", col_ano="Ano", top_n=5)
     if out.empty:
         st.info("Não foi possível calcular elasticidades (dados insuficientes / variação nula).")
     else:
-        st.caption(
-            "• **Elasticidade_média (pct/pct)** = média de (Δ% despesa / Δ% variável) — igual notebook.\n"
-            "• **Elasticidade_aprox (log-diff)** = regressão em log-diferenças (mais estável quando há ruído)."
-        )
         st.dataframe(out, use_container_width=True)
+
+        # pequeno gráfico horizontal (sem boxplot)
+        fig, ax = plt.subplots()
+        ax.barh(out["Variável"], out["Elasticidade_aprox"])
+        ax.axvline(0, linestyle="--", alpha=0.3)
+        ax.set_xlabel("Elasticidade aproximada (correlação de %Δ)")
+        ax.set_title("Top 5 — Elasticidade aproximada (notebook)")
+        ax.grid(True, axis="x", alpha=0.2)
+        st.pyplot(fig)
 
 elif menu == "Segurados":
     st.header("Segurados")
+    if col_segurados is None:
+        st.warning("Sem coluna de Segurados.")
+        st.stop()
+
     ser = df_periodo.set_index("Ano")[col_segurados].dropna()
     safe_line_plot(ser.index, ser.values, "Evolução — Segurados", "Ano", "Segurados")
 
-    # ✅ pedido: remover BOX no Segurados (não mostrar)
-    st.info("Boxplot removido conforme solicitado (fica apenas a evolução por ano).")
-
 elif menu == "Beneficiários":
     st.header("Beneficiários")
+    if col_beneficiarios is None:
+        st.warning("Sem coluna de Beneficiários.")
+        st.stop()
+
     ser = df_periodo.set_index("Ano")[col_beneficiarios].dropna()
     safe_line_plot(ser.index, ser.values, "Evolução — Beneficiários", "Ano", "Beneficiários")
-    safe_box_plot(ser.values, "Box — Beneficiários (período)", "Beneficiários")
 
-elif menu == "Previsões (executar)":
-    st.header("Previsões (executar)")
+elif menu == "Previsão SARIMAX (igual ao notebook)":
+    st.header("Previsão de Despesa Total com SARIMAX (igual ao notebook)")
 
-    serie_name, y = None, None
-    if has_sdo and has_mat:
-        serie_name = "Ramo Doença e Maternidade (SDO + MATERNIDADE)"
-        y = (
-            df_periodo.set_index("Ano")[["despesa_SDO", "despesa_MATERNIDADE"]]
-            .fillna(0)
-            .sum(axis=1)
-            .dropna()
-        )
-    elif col_despesa_total is not None:
-        serie_name = "Despesa total (despesa_total)"
-        y = df_periodo.set_index("Ano")[col_despesa_total].dropna()
-    else:
-        st.warning("Não há série disponível para previsão.")
+    if col_despesa_total is None:
+        st.warning("Sem despesa_total.")
         st.stop()
 
-    st.subheader(f"Série usada: {serie_name}")
+    # Exógenas do notebook (precisa das 3)
+    exog_cols = []
+    if col_segurados is not None:
+        exog_cols.append(col_segurados)
+    if col_pop_emp is not None:
+        exog_cols.append(col_pop_emp)
+    if col_pensionista_inps is not None:
+        exog_cols.append(col_pensionista_inps)
 
-    if len(y) < 6:
-        st.info("Série curta: recomenda-se pelo menos 6 anos. Selecione mais anos no período.")
-        st.stop()
-
-    horizon = st.slider("Horizonte (anos)", 1, 10, 3)
-    method = st.radio("Modelo", ["ARIMA", "ETS"], horizontal=True)
-
-    safe_line_plot(y.index.tolist(), y.values.tolist(), "Histórico", "Ano", "Valor")
-
-    run_forecast = st.button("Gerar previsão")
-    if not run_forecast:
-        st.info("Clique em **Gerar previsão** para executar (mantém o dashboard leve).")
-        st.stop()
-
-    ydf = y.reset_index()
-    ydf.columns = ["Ano", "despesa_total"]
-
-    try:
-        _train_df, _test_df, y_train, _y_test = train_test_split_time(
-            ydf,
-            year_col="Ano",
-            target="despesa_total",
-            test_years=1,
-        )
-    except TypeError:
+    if len(exog_cols) < 3:
         st.error(
-            "A função train_test_split_time do teu src/time_series.py tem assinatura diferente. "
-            "Ajusta para year_col/target/test_years."
+            "Para ficar IGUAL ao notebook, o dataset precisa destas colunas:\n"
+            "- Segurados\n- População_empregada\n- Pensionista_INPS\n\n"
+            f"Detectadas agora: {exog_cols}"
         )
         st.stop()
 
-    if method == "ARIMA":
-        yhat, _meta = forecast_arima(y_train, steps=horizon)
-    else:
-        yhat, _meta = forecast_ets(y_train, steps=horizon)
+    # dataset do período (ordenado)
+    d = df_periodo[["Ano", col_despesa_total] + exog_cols].dropna().sort_values("Ano").copy()
+    d = d.rename(columns={col_despesa_total: "despesa_total"})
 
-    future_years = list(range(int(y.index.max()) + 1, int(y.index.max()) + horizon + 1))
-    yhat_vals = np.array(yhat).reshape(-1)
+    if len(d) < 8:
+        st.info("Série curta para SARIMAX. Selecione mais anos no filtro de período.")
+        st.stop()
 
-    fig, ax = plt.subplots()
-    ax.plot(y.index, y.values, marker="o", label="Histórico")
-    ax.plot(future_years, yhat_vals, marker="o", linestyle="--", label="Projeção")
-    ax.set_title(f"Previsão ({method}) — projeção destacada")
+    ultimo_ano = int(d["Ano"].max())
+    ano_fim = st.slider("Prever até ao ano", min_value=ultimo_ano + 1, max_value=ultimo_ano + 20, value=max(ultimo_ano + 6, ultimo_ano + 1))
+    steps = int(ano_fim - ultimo_ano)
+
+    st.caption(f"Ajuste: SARIMAX(1,1,1) com exógenas {exog_cols} | Base: {d['Ano'].min()}–{ultimo_ano} | Passos: {steps}")
+
+    run_btn = st.button("Gerar previsão SARIMAX")
+    if not run_btn:
+        st.info("Clique em **Gerar previsão SARIMAX** para executar (mantém o dashboard leve).")
+        st.stop()
+
+    y = pd.to_numeric(d["despesa_total"], errors="coerce").values
+    exog_hist = d[exog_cols].apply(pd.to_numeric, errors="coerce").values
+
+    if np.isnan(y).any() or np.isnan(exog_hist).any():
+        st.error("Há NaN nas séries usadas (despesa_total ou exógenas). Verifica o CSV/periodo.")
+        st.stop()
+
+    # Fit
+    try:
+        res = fit_sarimax(y, exog_hist)
+    except Exception as e:
+        st.error(f"Erro ao ajustar SARIMAX: {e}")
+        st.stop()
+
+    # Exógenas futuras (igual notebook: crescimento médio histórico)
+    exog_future_df = build_exog_future_from_mean_growth(d, exog_cols, steps=steps)
+    if exog_future_df.isna().any().any():
+        st.error("Falha ao projetar exógenas futuras (há NaN). Verifica valores finais das colunas exógenas.")
+        st.stop()
+
+    # Forecast + IC
+    try:
+        fc = res.get_forecast(steps=steps, exog=exog_future_df.values)
+        fc_mean = pd.Series(fc.predicted_mean)
+        fc_ci = fc.conf_int()
+    except Exception as e:
+        st.error(f"Erro ao prever com SARIMAX: {e}")
+        st.stop()
+
+    anos_previstos = list(range(ultimo_ano + 1, ultimo_ano + steps + 1))
+
+    st.subheader("Tabela de previsão (com IC 95%)")
+    out = pd.DataFrame(
+        {
+            "Ano": anos_previstos,
+            "Previsão": fc_mean.values,
+            "IC_95_inf": fc_ci.iloc[:, 0].values,
+            "IC_95_sup": fc_ci.iloc[:, 1].values,
+        }
+    )
+    st.dataframe(out, use_container_width=True)
+
+    st.subheader("Gráfico (histórico + previsão + IC)")
+    fig, ax = plt.subplots(figsize=(12, 5))
+    ax.plot(d["Ano"], d["despesa_total"], marker="o", label="Observado")
+    ax.plot(anos_previstos, fc_mean.values, marker="o", linestyle="--", label="Previsto (SARIMAX)")
+    ax.fill_between(
+        anos_previstos,
+        fc_ci.iloc[:, 0].values,
+        fc_ci.iloc[:, 1].values,
+        alpha=0.2,
+        label="IC 95%",
+    )
     ax.set_xlabel("Ano")
-    ax.set_ylabel("Valor")
-    ax.grid(True, alpha=0.3)
+    ax.set_ylabel("Despesa Total")
+    ax.set_title("Previsão de Despesa Total com SARIMAX(1,1,1) — alinhado com notebook")
+    ax.grid(alpha=0.3)
     ax.legend()
     st.pyplot(fig)
-
-    st.subheader("Tabela de projeção")
-    st.dataframe(pd.DataFrame({"Ano": future_years, "Projecao": yhat_vals}), use_container_width=True)
 
 elif menu == "ML (executar)":
     st.header("ML — comparação de modelos (executar)")
