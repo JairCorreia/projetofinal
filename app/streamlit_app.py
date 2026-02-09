@@ -1,14 +1,8 @@
 # app/streamlit_app.py
 # ============================================================
-# DASHBOARD (alinhado com o notebook)
-# ✅ Sem boxplot em NENHUMA página
-# ✅ Elasticidade igual ao notebook: "elasticidade aproximada" (correlação entre %Δ)
-# ✅ Top 5 fixo
-# ✅ Previsão SARIMAX(1,1,1) igual ao notebook:
-#    - exógenas: Segurados + População_empregada + Pensionista_INPS
-#    - exog_future: projeção por crescimento médio histórico
-#    - IC 95% robusto (conf_int DataFrame ou ndarray)
-# ============================================================
+# DASHBOARD 
+
+
 
 import sys
 from pathlib import Path
@@ -443,7 +437,7 @@ elif menu == "Beneficiários":
     safe_line_plot(ser.index, ser.values, "Evolução — Beneficiários", "Ano", "Beneficiários")
 
 elif menu == "Previsão SARIMAX (notebook)":
-    st.header("Previsão de Despesa Total com SARIMAX (igual ao notebook)")
+    st.header("Previsão de Despesa Total com SARIMAX ")
 
     if col_despesa_total is None:
         st.warning("Sem despesa_total.")
