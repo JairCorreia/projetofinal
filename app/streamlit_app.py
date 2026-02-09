@@ -1,6 +1,13 @@
 # app/streamlit_app.py
 # ============================================================
-# DASHBOARD 
+# DASHBOARD (alinhado com o notebook)
+# ✅ Sem boxplot em NENHUMA página
+# ✅ Elasticidade igual ao notebook: "elasticidade aproximada" (correlação entre %Δ)
+# ✅ Top 5 fixo
+# ✅ Previsão SARIMAX(1,1,1) igual ao notebook:
+#    - exógenas: Segurados + População_empregada + Pensionista_INPS
+#    - exog_future: projeção por crescimento médio histórico
+#    - IC 95% robusto (conf_int DataFrame ou ndarray)
 # ============================================================
 
 import sys
@@ -142,7 +149,7 @@ def top_n_weights(df_ref: pd.DataFrame, rubricas: list[str], total_col: str, n: 
     return out
 
 
-# --- Elasticidade aproximada correlação de %Δ)
+# --- Elasticidade aproximada (IGUAL ao notebook: correlação de %Δ)
 def elasticidade_aproximada_notebook(
     df_in: pd.DataFrame,
     variavel_alvo: str = "despesa_total",
@@ -191,7 +198,7 @@ def save_report_md(report_md: str, report_path: Path) -> None:
     report_path.write_text(report_md or "", encoding="utf-8")
 
 
-# --- Previsão SARIMAX 
+# --- Previsão SARIMAX (igual notebook)
 def build_exog_future_from_mean_growth(df_hist: pd.DataFrame, exog_cols: list[str], steps: int) -> pd.DataFrame:
     """
     Projeta exógenas para o futuro como no notebook:
@@ -316,7 +323,7 @@ st.divider()
 # Menu
 pages = ["Visão Geral"]
 if col_despesa_total is not None:
-    pages += ["Despesas", "Peso das despesas (Top N)", "Elasticidades (Top 5)", "Previsão SARIMAX "]
+    pages += ["Despesas", "Peso das despesas (Top N)", "Elasticidades (Top 5)", "Previsão SARIMAX (notebook)"]
 if col_segurados is not None:
     pages += ["Segurados"]
 if col_beneficiarios is not None:
@@ -343,8 +350,8 @@ if menu == "Visão Geral":
             "populacao": col_pop,
             "PIB": col_gdp,
             "inflacao": col_infl,
-            "População_empregada ": col_pop_emp,
-            "Pensionista_INPS ": col_pensionista_inps,
+            "População_empregada (notebook)": col_pop_emp,
+            "Pensionista_INPS (notebook)": col_pensionista_inps,
             "rubricas_despesa_*": len(rubricas_cols_all),
         }
     )
@@ -395,7 +402,7 @@ elif menu == "Peso das despesas (Top N)":
     st.dataframe(out, use_container_width=True)
 
 elif menu == "Elasticidades (Top 5)":
-    st.header("Elasticidades (Top 5) (correlação de variações %)")
+    st.header("Elasticidades (Top 5) — igual ao notebook (correlação de variações %)")
 
     if col_despesa_total is None:
         st.warning("Sem despesa_total.")
@@ -415,7 +422,7 @@ elif menu == "Elasticidades (Top 5)":
         ax.barh(out["Variável"], out["Elasticidade_aprox"])
         ax.axvline(0, linestyle="--", alpha=0.3)
         ax.set_xlabel("Elasticidade aproximada (correlação de %Δ)")
-        ax.set_title("Top 5 — Elasticidade aproximada ")
+        ax.set_title("Top 5 — Elasticidade aproximada (notebook)")
         ax.grid(True, axis="x", alpha=0.2)
         st.pyplot(fig)
 
@@ -453,6 +460,7 @@ elif menu == "Previsão SARIMAX (notebook)":
 
     if len(exog_cols) < 3:
         st.error(
+            "Para ficar IGUAL ao notebook, o dataset precisa destas colunas:\n"
             "- Segurados\n- População_empregada\n- Pensionista_INPS\n\n"
             f"Detectadas agora: {exog_cols}"
         )
